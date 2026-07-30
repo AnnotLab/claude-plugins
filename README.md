@@ -1,26 +1,16 @@
-# Annot Claude Code plugin (marketplace source)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://useannot.com/assets/logo/wordmark-dark.png">
+    <img src="https://useannot.com/assets/logo/wordmark-light.png" alt="Annot" width="160">
+  </picture>
+</p>
 
-This folder is the SOURCE OF TRUTH for the public plugin marketplace repo
-`AnnotLab/claude-plugins` (GitHub). The monorepo is private; this folder's
-contents are mirrored verbatim as the ROOT of that public repo by
-`scripts/publish-claude-plugin.sh`. Never edit the mirror directly.
+# Annot for Claude Code
 
-## What the plugin does
+Auto-save every Claude Code session to your [Annot](https://useannot.com) second
+brain — searchable, summarized, and connected to everything else you've saved.
 
-`annot` ships a SessionEnd hook that auto-saves every Claude Code session to the
-user's Annot second brain:
-
-- `hooks/hooks.json` — SessionEnd → `scripts/annot_ingest.py hook`, which spools
-  a job and detaches an uploader (Claude Code's exit is never delayed).
-- `scripts/annot_ingest.py` — single-file Python 3 stdlib client: hook, queued
-  gzip upload with retry, and the device-pairing `connect` flow.
-- `skills/connect` — `/annot:connect`, the one-time pairing command.
-
-Server side: `POST /v1/ingest/code-session` (services/api), authenticated by a
-personal ingest token from the pairing flow, gated by the `ingest.code_sessions`
-feature flag.
-
-## User install
+## Install
 
 ```
 /plugin marketplace add AnnotLab/claude-plugins
@@ -28,16 +18,31 @@ feature flag.
 /annot:connect
 ```
 
-## Publishing a release
+`/annot:connect` shows a short pairing code and opens your Annot account to
+approve it. Pair once per machine — from then on every session saves itself when
+it ends, with no action needed.
 
-1. Bump `version` in `plugins/annot/.claude-plugin/plugin.json` (users don't get
-   updates without a bump).
-2. Run `scripts/publish-claude-plugin.sh` from the monorepo root.
+## What you get
 
-## Local testing
+- **Auto-save** — a SessionEnd hook uploads each session's transcript in the
+  background. Claude Code's exit is never delayed; offline sessions queue and
+  retry on the next session end.
+- **Recall** — at chat start, Claude sees the *titles* of resources Annot has
+  saved about the repo you're in (past sessions, notes, pages). Content is only
+  loaded when you pick it yourself via `/annot:recall`.
+- **Control** — pause saving per device (without unpairing), toggle recall, or
+  revoke a device entirely from **Annot → Connections → Claude Code**. Set
+  `ANNOT_NO_INGEST=1` in a project's environment to keep that project's sessions
+  out.
 
-`/plugin marketplace add /path/to/monorepo/apps/claude-plugin` then
-`/plugin install annot@annotlab`. Point the client at a local API with
-`ANNOT_CONFIG_DIR=/tmp/annot-test` and an `api_url` of `http://localhost:8787`
-in the config file (or pair against it — the connect flow stores whatever
-`api_url` it was run with).
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/annot:connect` | One-time device pairing with your Annot account |
+| `/annot:recall` | Pick saved resources related to this repo to load into the session |
+
+## Privacy
+
+Your transcripts are uploaded only to your own Annot account, over HTTPS, using
+a device token you can revoke at any time. Nothing is shared with anyone else.

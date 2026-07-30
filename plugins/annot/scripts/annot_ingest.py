@@ -27,6 +27,7 @@ import gzip
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -40,7 +41,7 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "ingest.json")
 QUEUE_DIR = os.path.join(CONFIG_DIR, "queue")
 LOCK_PATH = os.path.join(CONFIG_DIR, "upload.lock")
 
-CLIENT_VERSION = "annot-plugin/0.1.0"
+CLIENT_VERSION = "annot-plugin/0.1.1"
 UPLOAD_TIMEOUT_SECONDS = 60
 MAX_STALE_JOBS_PER_RUN = 3
 PAIRING_POLL_SECONDS = 3
@@ -69,6 +70,48 @@ def save_config(cfg: dict) -> None:
 
 def api_url(cfg: dict) -> str:
     return (cfg.get("api_url") or DEFAULT_API_URL).rstrip("/")
+
+
+# -------------------------------------------------------------------- tls ----
+
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """A verifying context that works on Pythons shipped without root CAs.
+
+    python.org macOS installs have zero trusted roots until the user runs
+    "Install Certificates.command" — the default context then rejects every
+    HTTPS host, which reads as an Annot outage. Verification stays on; we only
+    widen where the roots come from: default paths, then certifi, then the CA
+    bundle the OS itself ships.
+    """
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
+    ctx = ssl.create_default_context()
+    if not ctx.cert_store_stats()["x509_ca"]:
+        try:
+            import certifi
+
+            ctx.load_verify_locations(certifi.where())
+        except (ImportError, OSError, ssl.SSLError):
+            for bundle in (
+                "/etc/ssl/cert.pem",  # macOS
+                "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu/Alpine
+                "/etc/pki/tls/certs/ca-bundle.crt",  # RHEL/Fedora
+            ):
+                try:
+                    ctx.load_verify_locations(bundle)
+                    break
+                except (OSError, ssl.SSLError):
+                    continue
+    _SSL_CONTEXT = ctx
+    return ctx
+
+
+def _is_cert_failure(exc: Exception) -> bool:
+    return isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError)
 
 
 # ------------------------------------------------------------------- hook ----
@@ -222,7 +265,9 @@ def _upload_job(cfg: dict, token: str, job: dict) -> str:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=UPLOAD_TIMEOUT_SECONDS):
+        with urllib.request.urlopen(
+            request, timeout=UPLOAD_TIMEOUT_SECONDS, context=_ssl_context()
+        ):
             return "done"
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
@@ -279,6 +324,16 @@ def cmd_connect() -> int:
         print(f"Annot: pairing failed ({exc.code}).", file=sys.stderr)
         return 1
     except (urllib.error.URLError, OSError) as exc:
+        if _is_cert_failure(exc):
+            print(
+                "Annot: your Python installation has no trusted CA certificates, so "
+                "it can't verify any HTTPS server (Annot itself is fine). On macOS "
+                "python.org installs, run \"Install Certificates.command\" from the "
+                "Python folder in /Applications — or `pip install certifi` — then "
+                "run connect again.",
+                file=sys.stderr,
+            )
+            return 1
         print(f"Annot: could not reach {base} ({exc}).", file=sys.stderr)
         return 1
 
@@ -341,12 +396,12 @@ def _post_json(url: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(request, timeout=15, context=_ssl_context()) as response:
         return json.load(response)
 
 
 def _get_json(url: str) -> dict:
-    with urllib.request.urlopen(url, timeout=15) as response:
+    with urllib.request.urlopen(url, timeout=15, context=_ssl_context()) as response:
         return json.load(response)
 
 

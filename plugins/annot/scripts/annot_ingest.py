@@ -2,10 +2,13 @@
 """Annot session ingest for Claude Code — hook, uploader, and pairing in one file.
 
 Modes:
-    annot_ingest.py hook      SessionEnd hook: spool a job, detach an uploader, exit.
-    annot_ingest.py upload    Detached uploader: drain the job queue over HTTP.
-    annot_ingest.py connect   One-time device pairing (also the /annot:connect skill).
-    annot_ingest.py status    Show config/queue state for debugging.
+    annot_ingest.py hook          SessionEnd hook: spool a job, detach an uploader, exit.
+    annot_ingest.py upload        Detached uploader: drain the job queue over HTTP.
+    annot_ingest.py connect       One-time device pairing (also the /annot:connect skill).
+    annot_ingest.py session-start SessionStart hook: inject a titles-only recall hint.
+    annot_ingest.py recall-list   Print related-resource titles as JSON (the /annot:recall skill).
+    annot_ingest.py recall-get ID Print one resource's content as JSON.
+    annot_ingest.py status        Show config/queue state for debugging.
 
 Design constraints, in order:
 1.  NEVER delay Claude Code. The hook mode does only local, sub-50ms work (read
@@ -32,6 +35,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -41,8 +45,11 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "ingest.json")
 QUEUE_DIR = os.path.join(CONFIG_DIR, "queue")
 LOCK_PATH = os.path.join(CONFIG_DIR, "upload.lock")
 
-CLIENT_VERSION = "annot-plugin/0.1.1"
+CLIENT_VERSION = "annot-plugin/0.2.0"
 UPLOAD_TIMEOUT_SECONDS = 60
+# The SessionStart hint blocks session startup, so its budget is tight: fail
+# open and silent on anything slower.
+RECALL_HINT_TIMEOUT_SECONDS = 2
 MAX_STALE_JOBS_PER_RUN = 3
 PAIRING_POLL_SECONDS = 3
 PAIRING_MAX_WAIT_SECONDS = 600
@@ -405,6 +412,114 @@ def _get_json(url: str) -> dict:
         return json.load(response)
 
 
+# ----------------------------------------------------------------- recall ----
+
+def _recall_eligible(cfg: dict, cwd: str) -> bool:
+    """Same opt-outs as ingest: unpaired, invalidated, ANNOT_NO_INGEST, deny_paths."""
+    if os.environ.get("ANNOT_NO_INGEST"):
+        return False
+    if not cfg.get("token") or cfg.get("token_invalid"):
+        return False
+    for deny in cfg.get("deny_paths") or []:
+        if isinstance(deny, str) and deny and cwd.startswith(os.path.expanduser(deny)):
+            return False
+    return True
+
+
+def _recall_request(cfg: dict, path: str, timeout: float) -> dict:
+    request = urllib.request.Request(
+        f"{api_url(cfg)}{path}",
+        headers={"Authorization": f"Bearer {cfg.get('token')}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+        return json.load(response)
+
+
+def cmd_session_start() -> int:
+    """SessionStart hook. Injects a titles-ONLY hint — content never enters the
+    session here; the user picks what to load via /annot:recall. Anything slow or
+    broken fails open and silent: a hint is never worth a wait or an error."""
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    cwd = event.get("cwd") or os.getcwd()
+    cfg = load_config()
+    if not _recall_eligible(cfg, cwd):
+        return 0
+    try:
+        data = _recall_request(
+            cfg,
+            "/v1/ingest/code-recall?cwd=" + urllib.parse.quote(cwd),
+            RECALL_HINT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        return 0
+    resources = [r for r in (data.get("resources") or []) if r.get("title")]
+    if not resources:
+        return 0
+    titles = "; ".join(f'"{r["title"]}"' for r in resources)
+    context = (
+        f"Annot (the user's second brain) has {len(resources)} saved resource(s) "
+        f"related to this repo: {titles}. Their content is NOT loaded. If any look "
+        "relevant to what the user asks, suggest /annot:recall so the user can pick "
+        "which to load — never load them unasked."
+    )
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": context,
+                }
+            }
+        )
+    )
+    return 0
+
+
+def cmd_recall_list() -> int:
+    """The /annot:recall skill's first leg: related resources for cwd, as JSON."""
+    cfg = load_config()
+    cwd = os.getcwd()
+    if not _recall_eligible(cfg, cwd):
+        print(json.dumps({"error": "not paired — run /annot:connect first", "resources": []}))
+        return 0
+    try:
+        data = _recall_request(
+            cfg, "/v1/ingest/code-recall?cwd=" + urllib.parse.quote(cwd), 15
+        )
+    except Exception as exc:
+        print(json.dumps({"error": f"could not reach Annot ({exc})", "resources": []}))
+        return 0
+    if data.get("enabled") is False:
+        data = {
+            "error": "recall is turned off in Annot → Connections → Claude Code",
+            "resources": [],
+        }
+    print(json.dumps(data))
+    return 0
+
+
+def cmd_recall_get(source_id: str) -> int:
+    """The /annot:recall skill's second leg: one picked resource's content."""
+    cfg = load_config()
+    try:
+        data = _recall_request(
+            cfg,
+            "/v1/ingest/code-recall/" + urllib.parse.quote(source_id.strip()),
+            30,
+        )
+    except urllib.error.HTTPError as exc:
+        print(json.dumps({"error": f"resource not available ({exc.code})"}))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"error": f"could not reach Annot ({exc})"}))
+        return 0
+    print(json.dumps(data))
+    return 0
+
+
 # ----------------------------------------------------------------- status ----
 
 def cmd_status() -> int:
@@ -432,6 +547,15 @@ def main() -> int:
         return cmd_upload()
     if mode == "connect":
         return cmd_connect()
+    if mode == "session-start":
+        try:
+            return cmd_session_start()
+        except Exception:
+            return 0  # a broken hook must never surface into Claude Code
+    if mode == "recall-list":
+        return cmd_recall_list()
+    if mode == "recall-get":
+        return cmd_recall_get(sys.argv[2] if len(sys.argv) > 2 else "")
     return cmd_status()
 
 

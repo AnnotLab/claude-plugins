@@ -45,11 +45,21 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "ingest.json")
 QUEUE_DIR = os.path.join(CONFIG_DIR, "queue")
 LOCK_PATH = os.path.join(CONFIG_DIR, "upload.lock")
 
-CLIENT_VERSION = "annot-plugin/0.2.0"
+CLIENT_VERSION = "annot-plugin/0.3.0"
+# Job keys forwarded verbatim as multipart form fields. Everything past `ended_at` is
+# repo identity (see _git_identity); the server treats every one as optional, so an
+# older plugin — or a session in a plain directory — simply omits them.
+UPLOAD_FIELDS = (
+    "session_id", "cwd", "reason", "ended_at",
+    "repo", "repo_path", "worktree", "worktree_name", "worktree_path", "git_branch",
+)
 UPLOAD_TIMEOUT_SECONDS = 60
 # The SessionStart hint blocks session startup, so its budget is tight: fail
 # open and silent on anything slower.
 RECALL_HINT_TIMEOUT_SECONDS = 2
+# One `git rev-parse` at session end. Short enough that a hung git (network FS, stale
+# lock) costs a blink rather than the hook's whole 10s budget.
+GIT_TIMEOUT_SECONDS = 1.0
 MAX_STALE_JOBS_PER_RUN = 3
 PAIRING_POLL_SECONDS = 3
 PAIRING_MAX_WAIT_SECONDS = 600
@@ -121,6 +131,88 @@ def _is_cert_failure(exc: Exception) -> bool:
     return isinstance(getattr(exc, "reason", None), ssl.SSLCertVerificationError)
 
 
+# --------------------------------------------------------- repo identity ----
+
+def _git(cwd: str, args: list, timeout: float = GIT_TIMEOUT_SECONDS) -> str:
+    """`git -C cwd <args>` stdout, or "" on ANY failure — including git not being
+    installed. Never raises, never blocks longer than the timeout."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd] + args, capture_output=True, text=True, timeout=timeout,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _git_identity(cwd: str, timeout: float = GIT_TIMEOUT_SECONDS) -> dict:
+    """Where this session ran: repository, branch, and worktree, or {} when unknown.
+
+    Resolved HERE rather than in the detached uploader because a queued job may not
+    upload for minutes (offline retry), by which time a `.claude/worktrees/<slug>`
+    directory can already be gone.
+
+    The one thing worth knowing: for a linked worktree `--git-common-dir` points at the
+    MAIN repo's .git, while `--show-toplevel` is the worktree's own root. So the real
+    repository is dirname(common-dir) — without that, every worktree session files
+    itself under a throwaway slug instead of the repo it belongs to.
+
+    Deliberately reads no remote. A git remote is a network identity (often private,
+    sometimes carrying a username) and nothing about filing a session in the user's own
+    library needs one.
+
+    An empty return is a normal outcome, not an error: git may be absent, and plenty of
+    sessions run in directories that are not repositories at all.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return {}
+    # --path-format=absolute (git >= 2.31) is required: without it --git-common-dir can
+    # come back relative, and dirname() of a relative path is not the repo root. On an
+    # older git the flag errors out, _git returns "", and the server's path heuristic
+    # takes over — which is exactly the pre-0.3.0 behavior.
+    out = _git(cwd, [
+        "rev-parse", "--path-format=absolute",
+        "--show-toplevel", "--git-common-dir", "--abbrev-ref", "HEAD",
+    ], timeout)
+    lines = [line.strip() for line in out.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return {}
+    toplevel, common_dir, branch = lines[0], lines[1], lines[2]
+    root = os.path.dirname(common_dir.rstrip("/")) or toplevel
+    ident = {
+        "repo": os.path.basename(root.rstrip("/")),
+        "repo_path": root,
+    }
+    if branch and branch != "HEAD":  # "HEAD" means detached: no branch to report
+        ident["git_branch"] = branch
+    try:
+        linked = os.path.realpath(toplevel) != os.path.realpath(root)
+    except OSError:
+        linked = toplevel.rstrip("/") != root.rstrip("/")
+    if linked:
+        ident["worktree"] = "1"
+        ident["worktree_name"] = os.path.basename(toplevel.rstrip("/"))
+        ident["worktree_path"] = toplevel
+    return ident
+
+
+def _recall_query(cwd: str, git_timeout: float) -> str:
+    """The code-recall query string for `cwd`, carrying repo identity when git resolves.
+
+    Sending `repo`/`repo_path` is what lets a session started inside a worktree find the
+    parent repository's sessions. The server can already infer that for the conventional
+    `.claude/worktrees/<slug>` layout from `cwd` alone, so this is an upgrade for
+    unconventional layouts rather than a requirement — hence the caller-chosen timeout,
+    tight enough for the SessionStart path to stay within its own budget.
+    """
+    params = {"cwd": cwd}
+    ident = _git_identity(cwd, git_timeout)
+    for key in ("repo", "repo_path"):
+        if ident.get(key):
+            params[key] = ident[key]
+    return urllib.parse.urlencode(params)
+
+
 # ------------------------------------------------------------------- hook ----
 
 def cmd_hook() -> int:
@@ -164,6 +256,12 @@ def cmd_hook() -> int:
         "reason": event.get("reason") or "",
         "ended_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    # The one place this file spends more than a few ms (constraint 1 above): up to
+    # GIT_TIMEOUT_SECONDS for a single `git rev-parse`. A deliberate exception, kept
+    # bounded, fully guarded, and placed AFTER the opt-out checks so an ANNOT_NO_INGEST
+    # or deny-path session never forks git at all. It rides in the job file so an
+    # offline-queued upload still carries it.
+    job.update(_git_identity(cwd))
     job_path = os.path.join(QUEUE_DIR, f"{session_id}.json")
     with open(job_path, "w", encoding="utf-8") as fh:
         json.dump(job, fh)
@@ -252,14 +350,10 @@ def _upload_job(cfg: dict, token: str, job: dict) -> str:
     if not raw.strip():
         return "poison"
 
+    fields = {name: str(job.get(name) or "") for name in UPLOAD_FIELDS}
+    fields["client_version"] = CLIENT_VERSION
     body, content_type = _multipart(
-        fields={
-            "session_id": job.get("session_id") or "",
-            "cwd": job.get("cwd") or "",
-            "reason": job.get("reason") or "",
-            "ended_at": job.get("ended_at") or "",
-            "client_version": CLIENT_VERSION,
-        },
+        fields=fields,
         file_field="transcript",
         filename="transcript.jsonl.gz",
         file_bytes=gzip.compress(raw),
@@ -450,7 +544,10 @@ def cmd_session_start() -> int:
     try:
         data = _recall_request(
             cfg,
-            "/v1/ingest/code-recall?cwd=" + urllib.parse.quote(cwd),
+            # A third of the hint's own budget for git: startup latency is the whole
+            # point of this path's timeouts, and the server's path heuristic covers
+            # the conventional worktree layout without it.
+            "/v1/ingest/code-recall?" + _recall_query(cwd, RECALL_HINT_TIMEOUT_SECONDS / 3),
             RECALL_HINT_TIMEOUT_SECONDS,
         )
     except Exception:
@@ -487,7 +584,7 @@ def cmd_recall_list() -> int:
         return 0
     try:
         data = _recall_request(
-            cfg, "/v1/ingest/code-recall?cwd=" + urllib.parse.quote(cwd), 15
+            cfg, "/v1/ingest/code-recall?" + _recall_query(cwd, GIT_TIMEOUT_SECONDS), 15
         )
     except Exception as exc:
         print(json.dumps({"error": f"could not reach Annot ({exc})", "resources": []}))
